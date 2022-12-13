@@ -1,0 +1,71 @@
+<!--
+@license
+Copyright 2017 Google Inc.
+Licensed under the Apache License, Version 2.0 (the "License");
+
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<script>
+  /**
+   * @polymerBehavior
+   */
+  EclipseBehaviors = window.EclipseBehaviors || {};
+
+  /**
+   * @polymerBehavior
+   */
+  EclipseBehaviors.ScrollToAnchorBehavior = {
+    properties: {
+      hash: {
+        type: String,
+        notify: true,
+        observer: '_scrollToAnchor'
+      },
+      wasAttached: {
+        type: Boolean
+      },
+      header: {
+        type: Object
+      }
+    },
+
+    attached: function() {
+      this.wasAttached = true;
+      this._scrollToAnchor(this.hash);
+    },
+
+    _scrollToAnchor: function(hash) {
+      if (!this.wasAttached) {
+        // not attached yet, style info might be wrong.
+        return;
+      }
+      if (hash && hash.length > 1) {
+        // ensure all dom-repeats have rendered.
+        Polymer.dom.flush();
+        var elementToFocus = this.$$("[name='" + hash + "']");
+        if (elementToFocus) {
+          elementToFocus.scrollIntoView(true);
+          this._adjustHeader(elementToFocus);
+        }
+      }
+    },
+
+    _adjustHeader: function(element) {
+        // Adjust by header height. For mobile this doesn't matter b/c the header hides.
+        var headerElement = this.header;
+        var headerHeight = (headerElement) ? headerElement.offsetHeight : 80;
+        if (document.body.scrollTop > headerHeight) {
+          document.body.scrollTop -= headerHeight;
+        }
+    }
+  }
+</script>

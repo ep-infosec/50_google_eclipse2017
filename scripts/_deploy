@@ -1,0 +1,59 @@
+#!/bin/bash
+#
+# Copyright 2016 Google Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -e
+echo "Deploying..."
+
+if [ "$LOCAL_DEV" != "true" ]; then
+  if [[ -z $APP || $APP == geo-server || $APP == geo-nginx ]]; then
+    kubectl apply -f build/geo/deployment.yaml --record
+    kubectl expose deployment geo --selector="app=geo" --target-port=80 --type=NodePort
+  fi
+
+  if [[ -z $APP || $APP == static-nginx ]]; then
+    kubectl apply -f build/static-nginx/deployment.yaml --record
+    kubectl expose deployment static-nginx --selector="app=static-nginx" --port=80 --target-port=80 --type=NodePort
+  fi
+else
+
+  GCR_PREFIX="gcr.io/$GCLOUD_PROJ_PREFIX${GCLOUD_PROJ_PREFIX:+"/"}$GCLOUD_PROJ"
+
+  if [[ -z $APP || $APP == datastore-emulator ]]; then
+    docker run -tid --name datastore-emulator -p 8999:8999 ${GCR_PREFIX}/datastore-emulator
+
+    # Wait for datastore-emulator to start in container
+    DATASTORE_EMULATOR_IP=$(docker inspect -f '{{ .NetworkSettings.IPAddress }}' datastore-emulator)
+
+    for i in $(seq 10); do
+      if $(nc -z $DATASTORE_EMULATOR_IP 8999); then
+         break
+      fi ;
+      sleep 1s;
+    done
+  fi
+  DATASTORE_EMULATOR_HOST_PORT=8999
+  DATASTORE_EMULATOR_HOST="datastore-emulator:${DATASTORE_EMULATOR_HOST_PORT}"
+
+  LINK="--link static-nginx --link geo-nginx"
+  [[ -z $APP || $APP == geo-server ]] && docker run -e DATASTORE_EMULATOR_HOST="$DATASTORE_EMULATOR_HOST" -tid --name geo-server --link datastore-emulator ${GCR_PREFIX}/geo-server
+  [[ -z $APP || $APP == geo-nginx ]] && docker run -tid --name geo-nginx --link geo-server ${GCR_PREFIX}/geo-nginx
+  if [[ -z $APP || $APP == static-nginx ]]; then
+    docker run -tid --name static-nginx ${GCR_PREFIX}/static-nginx
+  fi
+  [[ -z $APP || $APP == nginx-lb-emulator ]] && docker run -tid --name nginx-lb-emulator ${LINK} -p 80:80 -p 443:443 ${GCR_PREFIX}/nginx-lb-emulator
+fi
+
+echo "Done deploying."

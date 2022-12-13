@@ -1,0 +1,28 @@
+{
+  "entrypoint": "index.html",
+  "shell": "src/eclipse-app.html",
+  "fragments": [
+    "src/eclipse-overview.html",
+    "src/eclipse-about.html",
+    "src/eclipse-megamovie.html",
+    "src/eclipse-resources.html",
+    "src/eclipse-safety.html",
+    "src/eclipse-simulator.html",
+    "src/eclipse-view404.html",
+    "src/eclipse-faq.html",
+    "src/eclipse-instructions.html"
+  ],
+  "sources": [
+    "sitemap.xml",
+    "src/**/*",
+    "images/**/*",
+    "bower.json"
+  ],
+  "extraDependencies": [
+    "manifest.json",
+    "bower_components/webcomponentsjs/webcomponents-lite.min.js"
+  ],
+  "lint" : {
+    "rules": ["polymer-1"]
+  }
+}

@@ -1,0 +1,253 @@
+#!/bin/bash
+#
+# Copyright 2016 Google Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -e
+echo "Building..."
+
+BUILD_DIR=$PROJ_DIR/build
+mkdir -p $BUILD_DIR
+
+# Gcloud values
+GCR_PREFIX="gcr.io/$GCLOUD_PROJ_PREFIX${GCLOUD_PROJ_PREFIX:+"/"}$GCLOUD_PROJ"
+SED_SAFE_GCR_PREFIX=$(echo $GCR_PREFIX | sed -e 's:\/:\\\/:g')
+
+# make sure the right versions of polymer and such are installed
+REQUIRED_NODE_VER="v6"
+NODE_VER=$(node --version)
+if [[ $? != 0 ]]; then
+  echo "Unable to find Node.js"
+  exit 1
+fi
+if [[ $(echo $NODE_VER | cut -b 1,2) != $REQUIRED_NODE_VER ]]; then
+  echo "Wrong version of Node.js detected, please see README.md"
+  exit 1
+fi
+npm install &>/dev/null
+PATH="$PROJ_DIR/node_modules/.bin:$PATH"
+
+
+SRC_DIR=$PROJ_DIR/src
+
+# # # Select correct service account and secret_keys files for our selected environment
+cp -a $PROJ_DIR/common $BUILD_DIR
+cp -a $PROJ_DIR/common_tests $BUILD_DIR
+mkdir -p $BUILD_DIR/common/flask
+cp $PROJ_DIR/conf/service_account_$TARGET_ENV.json $BUILD_DIR/common/service_account.json
+SECRET_KEYS_SRC=$PROJ_DIR/conf/secret_keys_$TARGET_ENV.py
+cp $SECRET_KEYS_SRC $BUILD_DIR/common/secret_keys.py
+
+# # Process config.py file and save temporarily. Will delete this file when
+# # build is complete
+# if [ "$LOCAL_DEV" != "true" ]; then
+#   if [ "$TARGET_ENV" == "prod" ]; then
+#     CDN_HOSTNAME=https://prod.eclipsemega.movie/static
+#   else
+#     CDN_HOSTNAME=https://static_${TARGET_ENV}.eclipsemega.movie/static
+#   fi
+# else
+#   CDN_HOSTNAME=https://localhost/static
+# fi
+mkdir -p $BUILD_DIR/templates
+sed -e "s:{{GCLOUD_PROJ}}:$GCLOUD_PROJ:g" \
+    -e "s:{{PROJECT_ID}}:$SED_SAFE_PROJECT_ID:g" \
+    -e "s:{{UPLOAD_SERVER_RSS_MAX_USAGE_BYTES}}:$UPLOAD_SERVER_RSS_MAX_USAGE_BYTES:g" \
+    -e "s:{{PENDING_UPLOADS_MAX_USAGE_BYTES}}:$PENDING_UPLOADS_MAX_USAGE_BYTES:g" \
+    -e "s!{{CDN_HOSTNAME}}!$CDN_HOSTNAME!g" \
+    $PROJ_DIR/templates/config.py.tmpl > $BUILD_DIR/common/config.py
+
+if [[ -z $APP || $APP == base-container ]]; then
+  # Build base container
+  BASE_CONTAINER_TAG=$GCR_PREFIX/base-container
+  docker build -t $BASE_CONTAINER_TAG:latest -t $BASE_CONTAINER_TAG:$GIT_TAG base-container
+fi
+
+if [[ -z $APP || $APP == app-container ]]; then
+  # Build app container
+  APP_CONTAINER_DIR=$PROJ_DIR/app-container
+  APP_CONTAINER_BUILD_DIR=$BUILD_DIR/app-container
+  mkdir -p $APP_CONTAINER_BUILD_DIR/conf
+  sed -e "s:{{GCR_PREFIX_WITH_SLASH}}:${SED_SAFE_GCR_PREFIX}/:g" $APP_CONTAINER_DIR/templates/Dockerfile.tmpl > $APP_CONTAINER_BUILD_DIR/Dockerfile
+  APP_CONTAINER_TAG=$GCR_PREFIX/app-container
+  cp $APP_CONTAINER_DIR/conf/requirements.txt $APP_CONTAINER_BUILD_DIR/conf/requirements.txt
+  docker build  -t $APP_CONTAINER_TAG:latest -t $APP_CONTAINER_TAG:$GIT_TAG $APP_CONTAINER_BUILD_DIR
+fi
+
+if [[ -z $APP || $APP == nginx-container ]]; then
+  # Build nginx container
+  NGINX_CONTAINER_DIR=$PROJ_DIR/nginx-container
+  NGINX_CONTAINER_BUILD_DIR=$BUILD_DIR/nginx-container
+  mkdir -p $NGINX_CONTAINER_BUILD_DIR
+  sed -e "s:{{GCR_PREFIX_WITH_SLASH}}:${SED_SAFE_GCR_PREFIX}/:g" $NGINX_CONTAINER_DIR/templates/Dockerfile.tmpl > $NGINX_CONTAINER_BUILD_DIR/Dockerfile
+  NGINX_CONTAINER_TAG=$GCR_PREFIX/nginx-container
+  docker build  -t $NGINX_CONTAINER_TAG:latest -t $NGINX_CONTAINER_TAG:$GIT_TAG $NGINX_CONTAINER_BUILD_DIR
+fi
+
+if [[ -z $APP || $APP == static-nginx ]]; then
+  # Build static nginx container
+  STATIC_NGINX_CONTAINER_DIR=$PROJ_DIR/static-nginx
+  STATIC_NGINX_CONTAINER_BUILD_DIR=$BUILD_DIR/static-nginx
+  mkdir -p $STATIC_NGINX_CONTAINER_BUILD_DIR
+  cp -a $STATIC_NGINX_CONTAINER_DIR/app $STATIC_NGINX_CONTAINER_BUILD_DIR
+  cp -a $STATIC_NGINX_CONTAINER_DIR/conf $STATIC_NGINX_CONTAINER_BUILD_DIR
+  sed -e "s:{{GCR_PREFIX}}:$SED_SAFE_GCR_PREFIX:g" $STATIC_NGINX_CONTAINER_DIR/templates/deployment.yaml.tmpl > $STATIC_NGINX_CONTAINER_BUILD_DIR/deployment.yaml
+  sed -e "s:{{GCR_PREFIX_WITH_SLASH}}:${SED_SAFE_GCR_PREFIX}/:g" $STATIC_NGINX_CONTAINER_DIR/templates/Dockerfile.tmpl > $STATIC_NGINX_CONTAINER_BUILD_DIR/Dockerfile
+
+  STATIC_NGINX_CONTAINER_TAG=$GCR_PREFIX/static-nginx
+
+  # Create file with environment-specific client-id
+  CLIENT_ID=$(grep ^GOOGLE_OAUTH2_CLIENT_ID= $SECRET_KEYS_SRC | cut -f2 -d'=')
+  API_KEY=$(grep ^GOOGLE_HTTP_API_KEY= $SECRET_KEYS_SRC | cut -f2 -d'=')
+  CLIENT_ID_JS="var client_id = $CLIENT_ID;\nvar api_key = $API_KEY;"
+
+  # Create file with environment-specific client-id.
+  # Required for build, but is not included in the build.
+  # TODO(dek): list the file in extraDependencies, instead?
+  mkdir -p $STATIC_NGINX_CONTAINER_BUILD_DIR/app/static/build/default/src
+  echo -e $CLIENT_ID_JS > $STATIC_NGINX_CONTAINER_BUILD_DIR/app/static/src/client-id.js
+
+  # Our front end uses Polymer which will need to be set up using the node package
+  # manager as follows. From the project root directory:
+  STATIC_NGINX_CONTAINER_NPM_INSTALL=$STATIC_NGINX_CONTAINER_BUILD_DIR/.npm_install
+  STATIC_NGINX_CONTAINER_NPM_CONFIG=$STATIC_NGINX_CONTAINER_DIR/app/static/package.json
+  pushd $STATIC_NGINX_CONTAINER_BUILD_DIR/app/static
+  if [ ! -f $STATIC_NGINX_CONTAINER_NPM_INSTALL ] || [ $STATIC_NGINX_CONTAINER_NPM_CONFIG -nt $STATIC_NGINX_CONTAINER_NPM_INSTALL ]; then
+    npm install --no-spin --no-progress
+    touch $STATIC_NGINX_CONTAINER_NPM_INSTALL
+  fi
+
+  bower install
+
+  # this is a hack to work around https://github.com/Polymer/polymer-cli/pull/503
+  POLYMER_TMPFILE=/tmp/polymer-out
+  [[ -f $POLYMER_TMPFILE ]] && rm -f $POLYMER_TMPFILE
+  exec 5>&1
+  polymer build --preset es5-bundled --name default | tee /dev/fd/5 &>$POLYMER_TMPFILE
+
+  # verify the output since polymer is inconsistant about exiting properly
+  if [[ ! -z $(cat $POLYMER_TMPFILE | perl -pe 's/\e\[?.*?[\@-~]//g' | grep -v ^info:) ]]; then
+    echo "See Above: Errors from Polymer"
+    exit 1
+  fi
+
+  # Create file with environment-specific client-id
+  # Required for deployment
+  echo -e $CLIENT_ID_JS > $STATIC_NGINX_CONTAINER_BUILD_DIR/app/static/build/default/src/client-id.js
+
+  popd
+
+  # Create file with git tag.
+  echo -n $GIT_TAG > $STATIC_NGINX_CONTAINER_BUILD_DIR/app/static/build/default/hash.html
+
+  tar cvf $STATIC_NGINX_CONTAINER_BUILD_DIR/application.tar -C $STATIC_NGINX_CONTAINER_BUILD_DIR/app/static/build/default --owner www-data --group www-data --exclude="*.pyc" .
+
+  docker build --no-cache -t $STATIC_NGINX_CONTAINER_TAG:latest -t $STATIC_NGINX_CONTAINER_TAG:$GIT_TAG $STATIC_NGINX_CONTAINER_BUILD_DIR
+fi
+
+# The admin cloud datastore console is http://localhost:8999/_ah/admin
+DATASTORE_EMULATOR_DIR=$PROJ_DIR/datastore-emulator
+DATASTORE_EMULATOR_BUILD_DIR=$BUILD_DIR/datastore-emulator
+DATASTORE_EMULATOR_HOST_PORT=8999
+
+if [[ -z $APP || $APP == datastore-emulator ]]; then
+  mkdir -p $DATASTORE_EMULATOR_BUILD_DIR
+  sed -e "s:{{GCR_PREFIX_WITH_SLASH}}:${SED_SAFE_GCR_PREFIX}/:g" -e "s:{{PROJECT_ID}}:${PROJECT_ID}:g" -e "s:{{HOST_PORT}}:${DATASTORE_EMULATOR_HOST_PORT}:g" $DATASTORE_EMULATOR_DIR/templates/Dockerfile.tmpl > $DATASTORE_EMULATOR_BUILD_DIR/Dockerfile
+
+  # Build datastore emulator on local-dev builds
+  DATASTORE_EMULATOR_TAG=$GCR_PREFIX/datastore-emulator
+  docker build  -t $DATASTORE_EMULATOR_TAG:latest -t $DATASTORE_EMULATOR_TAG:$GIT_TAG $DATASTORE_EMULATOR_BUILD_DIR
+fi
+
+# Build geo pod
+GEO_DIR=$PROJ_DIR/geo
+GEO_BUILD_DIR=$BUILD_DIR/geo
+GEO_APP_DIR=$PROJ_DIR/geo/app
+GEO_APP_BUILD_DIR=$BUILD_DIR/geo/app
+mkdir -p $GEO_BUILD_DIR/app
+sed -e "s:{{GCR_PREFIX}}:$SED_SAFE_GCR_PREFIX:g" $GEO_DIR/templates/deployment.yaml.tmpl > $GEO_BUILD_DIR/deployment.yaml
+
+if [[ -z $APP || $APP == geo-server ]]; then
+  # Build geo app container
+  sed -e "s:{{GCR_PREFIX_WITH_SLASH}}:${SED_SAFE_GCR_PREFIX}/:g" -e "s#{{DATASTORE_EMULATOR}}#${DATASTORE_EMULATOR}#g" $GEO_APP_DIR/templates/Dockerfile.tmpl > $GEO_APP_BUILD_DIR/Dockerfile
+  cp -a $GEO_DIR/app/app $GEO_APP_BUILD_DIR
+  tar cvf $GEO_APP_BUILD_DIR/application.tar -C $GEO_APP_BUILD_DIR/app --owner www-data --group www-data --exclude="*.pyc" . ../../../common
+  GEO_CONTAINER_TAG=$GCR_PREFIX/geo-server
+  docker build  -t $GEO_CONTAINER_TAG:latest -t $GEO_CONTAINER_TAG:$GIT_TAG $GEO_APP_BUILD_DIR
+fi
+
+GEO_NGINX_CONTAINER_DIR=$PROJ_DIR/geo/nginx
+GEO_NGINX_CONTAINER_BUILD_DIR=$BUILD_DIR/geo/nginx
+mkdir -p $GEO_NGINX_CONTAINER_BUILD_DIR
+cp -a $GEO_NGINX_CONTAINER_DIR/conf $GEO_NGINX_CONTAINER_BUILD_DIR
+if [[ -z $APP || $APP == geo-nginx ]]; then
+  # Build geo-nginx container
+  sed -e "s:{{GCR_PREFIX_WITH_SLASH}}:${SED_SAFE_GCR_PREFIX}/:g" $GEO_NGINX_CONTAINER_DIR/templates/Dockerfile.tmpl > $GEO_NGINX_CONTAINER_BUILD_DIR/Dockerfile
+  mkdir -p $GEO_NGINX_CONTAINER_BUILD_DIR
+  if [[ $LOCAL_DEV != true ]]; then
+    sed -e "s:{{GEO_SERVER_HOSTNAME}}:127.0.0.1:g" $GEO_NGINX_CONTAINER_DIR/templates/nginx.conf.tmpl > $GEO_NGINX_CONTAINER_BUILD_DIR/conf/nginx/nginx.conf
+  else
+    sed -e "s:{{GEO_SERVER_HOSTNAME}}:geo-server:g" $GEO_NGINX_CONTAINER_DIR/templates/nginx.conf.tmpl > $GEO_NGINX_CONTAINER_BUILD_DIR/conf/nginx/nginx.conf
+  fi
+
+  GEO_NGINX_CONTAINER_CONTAINER_TAG=$GCR_PREFIX/geo-nginx
+  docker build  -t $GEO_NGINX_CONTAINER_CONTAINER_TAG:latest -t $GEO_NGINX_CONTAINER_CONTAINER_TAG:$GIT_TAG $GEO_NGINX_CONTAINER_BUILD_DIR
+fi
+
+
+NGINX_LB_EMULATOR_DIR=$PROJ_DIR/nginx-lb-emulator
+NGINX_LB_EMULATOR_BUILD_DIR=$PROJ_DIR/build/nginx-lb-emulator
+if [[ -z $APP || $APP == nginx-lb-emulator ]]; then
+  if [[ $LOCAL_DEV == true ]]; then
+    # Build load balancer emulator on local-dev builds
+    NGINX_LB_EMULATOR_TAG=$GCR_PREFIX/nginx-lb-emulator
+    mkdir -p $NGINX_LB_EMULATOR_BUILD_DIR
+    cp -a $NGINX_LB_EMULATOR_DIR/resources $NGINX_LB_EMULATOR_BUILD_DIR
+    sed -e "s:{{GCR_PREFIX_WITH_SLASH}}:${SED_SAFE_GCR_PREFIX}/:g" $NGINX_LB_EMULATOR_DIR/templates/Dockerfile.tmpl > $NGINX_LB_EMULATOR_BUILD_DIR/Dockerfile
+    sed -e "s:{{UNRELEASED}}::g" $NGINX_LB_EMULATOR_DIR/templates/nginx.conf.tmpl > $NGINX_LB_EMULATOR_BUILD_DIR/resources/nginx.conf
+    docker build  -t $NGINX_LB_EMULATOR_TAG:latest -t $NGINX_LB_EMULATOR_TAG:$GIT_TAG $NGINX_LB_EMULATOR_BUILD_DIR
+  fi
+fi
+
+TEST_CONTAINER_DIR=$PROJ_DIR/test-container
+TEST_CONTAINER_BUILD_DIR=$BUILD_DIR/test-container
+SCRIPTS_DIR=$PROJ_DIR/scripts
+if [[ -z $APP || $APP == test-container ]]; then
+  mkdir -p $TEST_CONTAINER_BUILD_DIR/{app,conf}
+  cp -a $SCRIPTS_DIR $TEST_CONTAINER_BUILD_DIR/app
+  cp -a $SRC_DIR/eclipse_gis/src/eclipse_gis $TEST_CONTAINER_BUILD_DIR/app
+  cp -a $SRC_DIR/eclipse_gis/data $TEST_CONTAINER_BUILD_DIR/app
+
+  sed -e "s:{{GCR_PREFIX_WITH_SLASH}}:${SED_SAFE_GCR_PREFIX}/:g"  -e "s#{{DATASTORE_EMULATOR}}#${DATASTORE_EMULATOR}#g" -e "s#{{PROJECT_ID}}#${PROJECT_ID}#g" $TEST_CONTAINER_DIR/templates/Dockerfile.tmpl > $TEST_CONTAINER_BUILD_DIR/Dockerfile
+  tar cvf $TEST_CONTAINER_BUILD_DIR/application.tar -C $TEST_CONTAINER_BUILD_DIR/app --owner www-data --group www-data --exclude="../../../common/flask*" --exclude="*.pyc" . ../../common ../../common_tests
+  cp $TEST_CONTAINER_DIR/conf/requirements.txt $TEST_CONTAINER_BUILD_DIR/conf/requirements.txt
+  TEST_CONTAINER_TAG=$GCR_PREFIX/test-container
+  docker build -t $TEST_CONTAINER_TAG:latest $TEST_CONTAINER_BUILD_DIR
+fi
+
+SYSTEM_TEST_CONTAINER_DIR=$PROJ_DIR/system-test-container
+SYSTEM_TEST_CONTAINER_BUILD_DIR=$BUILD_DIR/system-test-container
+if [[ -z $APP || $APP == system-test-container ]]; then
+    mkdir -p $SYSTEM_TEST_CONTAINER_BUILD_DIR/{app,conf}
+    cp -a $SYSTEM_TEST_CONTAINER_DIR/app $SYSTEM_TEST_CONTAINER_BUILD_DIR
+    mkdir -p $SYSTEM_TEST_CONTAINER_BUILD_DIR/app/common
+    echo "GIT_TAG='$GIT_TAG'" > $SYSTEM_TEST_CONTAINER_BUILD_DIR/app/common/git_tag.py
+    cp $SYSTEM_TEST_CONTAINER_DIR/conf/requirements.txt $SYSTEM_TEST_CONTAINER_BUILD_DIR/conf/requirements.txt
+    sed -e "s:{{GCR_PREFIX}}:$SED_SAFE_GCR_PREFIX:g" $SYSTEM_TEST_CONTAINER_DIR/templates/Dockerfile.tmpl > $SYSTEM_TEST_CONTAINER_BUILD_DIR/Dockerfile
+    sed -e "s:{{GCR_PREFIX}}:$SED_SAFE_GCR_PREFIX:g" -e "s:{{UPLOAD_SERVER_TOTAL_MAX_USAGE_MB}}:$UPLOAD_SERVER_TOTAL_MAX_USAGE_MB:g" $SYSTEM_TEST_CONTAINER_DIR/templates/test_pod.yaml.tmpl > $SYSTEM_TEST_CONTAINER_BUILD_DIR/test_pod.yaml
+    tar cvf $SYSTEM_TEST_CONTAINER_BUILD_DIR/application.tar -C $SYSTEM_TEST_CONTAINER_BUILD_DIR/app --owner www-data --group www-data --exclude="*.pyc" . ../../common
+    docker build  -t $GCR_PREFIX/system-test-container $SYSTEM_TEST_CONTAINER_BUILD_DIR
+fi
+
+echo "Done building."
